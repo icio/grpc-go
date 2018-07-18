@@ -22,7 +22,6 @@
 package transport
 
 import (
-	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -32,11 +31,13 @@ import (
 	"golang.org/x/net/context"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/credentials"
+	"google.golang.org/grpc/internal/grpcsync"
 	"google.golang.org/grpc/keepalive"
 	"google.golang.org/grpc/metadata"
 	"google.golang.org/grpc/stats"
 	"google.golang.org/grpc/status"
 	"google.golang.org/grpc/tap"
+	"google.golang.org/grpc/transport/client"
 )
 
 // recvMsg represents the received msg from the transport. All transport
@@ -159,6 +160,7 @@ const (
 	streamActive    streamState = iota
 	streamWriteDone             // EndStream sent
 	streamReadDone              // EndStream received
+	streamDraining              // Trailers received or error encountered
 	streamDone                  // the entire stream is finished.
 )
 
@@ -199,7 +201,16 @@ type Stream struct {
 
 	// On client-side it is the status error received from the server.
 	// On server-side it is unused.
-	status *status.Status
+	recvTrailer         client.Trailer  // Trailer available once the stream ends
+	recvTrailerSet      *grpcsync.Event // ...is set
+	effectiveTrailer    client.Trailer  // Trailer committed to this RPC
+	effectiveTrailerSet *grpcsync.Event // ...is set
+	/*
+		status *status.Status
+		trailerStatus *status.Status
+		gotTrailer    *grpcsync.Event
+		statusSet     chan struct{}
+	*/
 
 	bytesReceived uint32 // indicates whether any bytes have been received on this stream
 	unprocessed   uint32 // set if the server sends a refused stream or GOAWAY including this stream
@@ -260,12 +271,6 @@ func (s *Stream) SetSendCompress(str string) {
 	s.sendCompress = str
 }
 
-// Done returns a channel which is closed when it receives the final status
-// from the server.
-func (s *Stream) Done() <-chan struct{} {
-	return s.done
-}
-
 // Header acquires the key-value pairs of header metadata once it
 // is available. It blocks until i) the metadata is ready or ii) there is no
 // header metadata or iii) the stream is canceled/expired.
@@ -323,13 +328,6 @@ func (s *Stream) Context() context.Context {
 // Method returns the method for the stream.
 func (s *Stream) Method() string {
 	return s.method
-}
-
-// Status returns the status received from the server.
-// Status can be read safely only after the stream has ended,
-// that is, after Done() is closed.
-func (s *Stream) Status() *status.Status {
-	return s.status
 }
 
 // SetHeader sets the header metadata. This can be called multiple times.
@@ -455,49 +453,6 @@ func NewServerTransport(protocol string, conn net.Conn, config *ServerConfig) (S
 	return newHTTP2Server(conn, config)
 }
 
-// ConnectOptions covers all relevant options for communicating with the server.
-type ConnectOptions struct {
-	// UserAgent is the application user agent.
-	UserAgent string
-	// Dialer specifies how to dial a network address.
-	Dialer func(context.Context, string) (net.Conn, error)
-	// FailOnNonTempDialError specifies if gRPC fails on non-temporary dial errors.
-	FailOnNonTempDialError bool
-	// PerRPCCredentials stores the PerRPCCredentials required to issue RPCs.
-	PerRPCCredentials []credentials.PerRPCCredentials
-	// TransportCredentials stores the Authenticator required to setup a client connection.
-	TransportCredentials credentials.TransportCredentials
-	// KeepaliveParams stores the keepalive parameters.
-	KeepaliveParams keepalive.ClientParameters
-	// StatsHandler stores the handler for stats.
-	StatsHandler stats.Handler
-	// InitialWindowSize sets the initial window size for a stream.
-	InitialWindowSize int32
-	// InitialConnWindowSize sets the initial window size for a connection.
-	InitialConnWindowSize int32
-	// WriteBufferSize sets the size of write buffer which in turn determines how much data can be batched before it's written on the wire.
-	WriteBufferSize int
-	// ReadBufferSize sets the size of read buffer, which in turn determines how much data can be read at most for one read syscall.
-	ReadBufferSize int
-	// ChannelzParentID sets the addrConn id which initiate the creation of this client transport.
-	ChannelzParentID int64
-	// MaxHeaderListSize sets the max (uncompressed) size of header list that is prepared to be received.
-	MaxHeaderListSize *uint32
-}
-
-// TargetInfo contains the information of the target such as network address and metadata.
-type TargetInfo struct {
-	Addr      string
-	Metadata  interface{}
-	Authority string
-}
-
-// NewClientTransport establishes the transport with the required ConnectOptions
-// and returns it to the caller.
-func NewClientTransport(connectCtx, ctx context.Context, target TargetInfo, opts ConnectOptions, onSuccess func(), onGoAway func(GoAwayReason), onClose func()) (ClientTransport, error) {
-	return newHTTP2Client(connectCtx, ctx, target, opts, onSuccess, onGoAway, onClose)
-}
-
 // Options provides additional hints and information for message
 // transmission.
 type Options struct {
@@ -530,53 +485,6 @@ type CallHdr struct {
 	ContentSubtype string
 
 	PreviousAttempts int // value of grpc-previous-rpc-attempts header to set
-}
-
-// ClientTransport is the common interface for all gRPC client-side transport
-// implementations.
-type ClientTransport interface {
-	// Close tears down this transport. Once it returns, the transport
-	// should not be accessed any more. The caller must make sure this
-	// is called only once.
-	Close() error
-
-	// GracefulClose starts to tear down the transport. It stops accepting
-	// new RPCs and wait the completion of the pending RPCs.
-	GracefulClose() error
-
-	// Write sends the data for the given stream. A nil stream indicates
-	// the write is to be performed on the transport as a whole.
-	Write(s *Stream, hdr []byte, data []byte, opts *Options) error
-
-	// NewStream creates a Stream for an RPC.
-	NewStream(ctx context.Context, callHdr *CallHdr) (*Stream, error)
-
-	// CloseStream clears the footprint of a stream when the stream is
-	// not needed any more. The err indicates the error incurred when
-	// CloseStream is called. Must be called when a stream is finished
-	// unless the associated transport is closing.
-	CloseStream(stream *Stream, err error)
-
-	// Error returns a channel that is closed when some I/O error
-	// happens. Typically the caller should have a goroutine to monitor
-	// this in order to take action (e.g., close the current transport
-	// and create a new one) in error case. It should not return nil
-	// once the transport is initiated.
-	Error() <-chan struct{}
-
-	// GoAway returns a channel that is closed when ClientTransport
-	// receives the draining signal from the server (e.g., GOAWAY frame in
-	// HTTP/2).
-	GoAway() <-chan struct{}
-
-	// GetGoAwayReason returns the reason why GoAway frame was received.
-	GetGoAwayReason() GoAwayReason
-
-	// IncrMsgSent increments the number of message sent through this transport.
-	IncrMsgSent()
-
-	// IncrMsgRecv increments the number of message received through this transport.
-	IncrMsgRecv()
 }
 
 // ServerTransport is the common interface for all gRPC server-side transport
@@ -656,14 +564,11 @@ func (e ConnectionError) Origin() error {
 
 var (
 	// ErrConnClosing indicates that the transport is closing.
-	ErrConnClosing = connectionErrorf(true, nil, "transport is closing")
+	ErrConnClosing = status.Errorf(codes.Unavailable, "transport is closing")
 	// errStreamDrain indicates that the stream is rejected because the
 	// connection is draining. This could be caused by goaway or balancer
 	// removing the address.
 	errStreamDrain = status.Error(codes.Unavailable, "the connection is draining")
-	// errStreamDone is returned from write at the client side to indiacte application
-	// layer of an error.
-	errStreamDone = errors.New("the stream is done")
 	// StatusGoAway indicates that the server sent a GOAWAY that included this
 	// stream's ID in unprocessed RPCs.
 	statusGoAway = status.New(codes.Unavailable, "the stream is rejected because server is draining the connection")

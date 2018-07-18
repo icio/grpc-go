@@ -20,24 +20,62 @@
 // the sync package.
 package grpcsync
 
-import "sync"
+import (
+	"sync"
+)
 
 // Event represents a one-time event that may occur in the future.
 type Event struct {
-	c chan struct{}
-	o sync.Once
+	mu     sync.Mutex
+	c      chan struct{}
+	onFire []func()
 }
 
-// Fire causes e to complete.  It is safe to call multiple times, and
-// concurrently.  It returns true iff this call to Fire caused the signaling
-// channel returned by Done to close.
+// Fire causes e to complete and all callbacks registered via OnFire to be
+// called synchronously.  It is safe to call multiple times, and concurrently.
+// It returns true iff this call to Fire caused the signaling channel returned
+// by Done to close.
 func (e *Event) Fire() bool {
-	ret := false
-	e.o.Do(func() {
-		close(e.c)
-		ret = true
-	})
-	return ret
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if e.HasFired() {
+		return false
+	}
+	for _, of := range e.onFire {
+		of()
+	}
+	close(e.c)
+	return true
+}
+
+// OnFire registers f to be called when e fires.  If e has already fired, calls
+// f synchronously.
+func (e *Event) OnFire(f func()) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if e.HasFired() {
+		f()
+		return
+	}
+	e.onFire = append(e.onFire, f)
+}
+
+// DoThenFire calls f if e has not yet fired, and then causes the event to be
+// fired by this call, and returns true.  Other synchronous callers of Do or
+// Fire will block and return false when the event is fired.  If e has already
+// fired, does nothing and returns false.
+func (e *Event) DoThenFire(f func()) bool {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if e.HasFired() {
+		return false
+	}
+	f()
+	for _, of := range e.onFire {
+		of()
+	}
+	close(e.c)
+	return true
 }
 
 // Done returns a channel that will be closed when Fire is called.

@@ -19,8 +19,9 @@
 package grpc
 
 import (
-	"errors"
+	"bytes"
 	"io"
+	"io/ioutil"
 	"math"
 	"strconv"
 	"sync"
@@ -34,10 +35,14 @@ import (
 	"google.golang.org/grpc/grpclog"
 	"google.golang.org/grpc/internal/channelz"
 	"google.golang.org/grpc/internal/grpcrand"
-	"google.golang.org/grpc/internal/transport"
 	"google.golang.org/grpc/metadata"
+	"google.golang.org/grpc/peer"
 	"google.golang.org/grpc/stats"
 	"google.golang.org/grpc/status"
+	"google.golang.org/grpc/transport"
+	"google.golang.org/grpc/transport/client"
+
+	inttrans "google.golang.org/grpc/internal/transport"
 )
 
 // StreamHandler defines the handler called by gRPC server to complete the
@@ -193,7 +198,7 @@ func newClientStream(ctx context.Context, desc *StreamDesc, cc *ClientConn, meth
 		return nil, err
 	}
 
-	callHdr := &transport.CallHdr{
+	callHdr := &inttrans.CallHdr{
 		Host:           cc.authority,
 		Method:         method,
 		ContentSubtype: c.contentSubtype,
@@ -312,24 +317,26 @@ func (cs *clientStream) newAttemptLocked(sh stats.Handler, trInfo traceInfo) err
 	}
 	cs.attempt.t = t
 	cs.attempt.done = done
+	i := t.Info2()
+	cs.attempt.peerCtx = peer.NewContext(cs.ctx, &peer.Peer{Addr: i.RemoteAddr, AuthInfo: i.AuthInfo})
 	return nil
 }
 
 func (a *csAttempt) newStream() error {
 	cs := a.cs
 	cs.callHdr.PreviousAttempts = cs.numRetries
-	s, err := a.t.NewStream(cs.ctx, cs.callHdr)
+
+	s, err := a.t.NewStream2(cs.ctx, client.Header{MaxRecvMsgSize: cs.callInfo.maxReceiveMessageSize, Options: []interface{}{cs.callHdr}})
 	if err != nil {
 		return toRPCErr(err)
 	}
 	cs.attempt.s = s
-	cs.attempt.p = &parser{r: s}
 	return nil
 }
 
 // clientStream implements a client side Stream.
 type clientStream struct {
-	callHdr  *transport.CallHdr
+	callHdr  *inttrans.CallHdr
 	opts     []CallOption
 	callInfo *callInfo
 	cc       *ClientConn
@@ -365,11 +372,11 @@ type clientStream struct {
 // csAttempt implements a single transport stream attempt within a
 // clientStream.
 type csAttempt struct {
-	cs   *clientStream
-	t    transport.ClientTransport
-	s    *transport.Stream
-	p    *parser
-	done func(balancer.DoneInfo)
+	peerCtx context.Context
+	cs      *clientStream
+	t       client.Transport
+	s       client.Stream
+	done    func(balancer.DoneInfo)
 
 	finished  bool
 	dc        Decompressor
@@ -395,6 +402,13 @@ func (cs *clientStream) commitAttempt() {
 	cs.mu.Unlock()
 }
 
+func isSet(b *bool) bool {
+	if b == nil {
+		return false
+	}
+	return *b
+}
+
 // shouldRetry returns nil if the RPC should be retried; otherwise it returns
 // the error that should be returned by the operation.
 func (cs *clientStream) shouldRetry(err error) error {
@@ -408,11 +422,14 @@ func (cs *clientStream) shouldRetry(err error) error {
 		// RPC is finished or committed; cannot retry.
 		return err
 	}
-	// Wait for the trailers.
+	var trailer client.Trailer
+	unproc := true // If no stream was started, it must be unprocessed.
 	if cs.attempt.s != nil {
-		<-cs.attempt.s.Done()
+		// Wait for the trailer.
+		trailer = cs.attempt.s.RecvTrailer2()
+		unproc = isSet(cs.attempt.s.Info2().Unprocessed)
 	}
-	if cs.firstAttempt && !cs.callInfo.failFast && (cs.attempt.s == nil || cs.attempt.s.Unprocessed()) {
+	if cs.firstAttempt && !cs.callInfo.failFast && unproc {
 		// First attempt, wait-for-ready, stream unprocessed: transparently retry.
 		cs.firstAttempt = false
 		return nil
@@ -425,16 +442,14 @@ func (cs *clientStream) shouldRetry(err error) error {
 	pushback := 0
 	hasPushback := false
 	if cs.attempt.s != nil {
-		if to, toErr := cs.attempt.s.TrailersOnly(); toErr != nil {
-			// Context error; stop now.
-			return toErr
-		} else if !to {
+		if cs.attempt.s.RecvHeader2() != nil {
+			// Not trailers-only; cannot retry.
 			return err
 		}
 
 		// TODO(retry): Move down if the spec changes to not check server pushback
 		// before considering this a failure for throttling.
-		sps := cs.attempt.s.Trailer()["grpc-retry-pushback-ms"]
+		sps := trailer.Metadata["grpc-retry-pushback-ms"]
 		if len(sps) == 1 {
 			var e error
 			if pushback, e = strconv.Atoi(sps[0]); e != nil || pushback < 0 {
@@ -452,7 +467,7 @@ func (cs *clientStream) shouldRetry(err error) error {
 
 	var code codes.Code
 	if cs.attempt.s != nil {
-		code = cs.attempt.s.Status().Code()
+		code = trailer.Status.Code()
 	} else {
 		code = status.Convert(err).Code()
 	}
@@ -519,7 +534,7 @@ func (cs *clientStream) Context() context.Context {
 	cs.commitAttempt()
 	// No need to lock before using attempt, since we know it is committed and
 	// cannot change.
-	return cs.attempt.s.Context()
+	return cs.attempt.peerCtx
 }
 
 func (cs *clientStream) withRetry(op func(a *csAttempt) error, onSuccess func()) error {
@@ -537,13 +552,17 @@ func (cs *clientStream) withRetry(op func(a *csAttempt) error, onSuccess func())
 			// We started another attempt already.
 			continue
 		}
-		if err == io.EOF {
-			<-a.s.Done()
-		}
-		if err == nil || (err == io.EOF && a.s.Status().Code() == codes.OK) {
+		if err == nil {
 			onSuccess()
 			cs.mu.Unlock()
-			return err
+			return nil
+		}
+		if err == io.EOF {
+			if a.s.RecvTrailer2().Status.Code() == codes.OK {
+				onSuccess()
+				cs.mu.Unlock()
+				return io.EOF
+			}
 		}
 		if err := cs.retryLocked(err); err != nil {
 			cs.mu.Unlock()
@@ -555,9 +574,11 @@ func (cs *clientStream) withRetry(op func(a *csAttempt) error, onSuccess func())
 func (cs *clientStream) Header() (metadata.MD, error) {
 	var m metadata.MD
 	err := cs.withRetry(func(a *csAttempt) error {
-		var err error
-		m, err = a.s.Header()
-		return toRPCErr(err)
+		if h := a.s.RecvHeader2(); h != nil {
+			m = h.Metadata
+			return nil
+		}
+		return a.s.RecvTrailer2().Status.Err()
 	}, cs.commitAttemptLocked)
 	if err != nil {
 		cs.finish(err)
@@ -577,7 +598,7 @@ func (cs *clientStream) Trailer() metadata.MD {
 	if cs.attempt.s == nil {
 		return nil
 	}
-	return cs.attempt.s.Trailer()
+	return cs.attempt.s.RecvTrailer2().Metadata
 }
 
 func (cs *clientStream) replayBufferLocked() error {
@@ -603,6 +624,53 @@ func (cs *clientStream) bufferForRetryLocked(sz int, op func(a *csAttempt) error
 	cs.buffer = append(cs.buffer, op)
 }
 
+type outgoingMessage struct {
+	// Set during initialization
+	m  interface{}
+	mi *transport.MessageInfo
+	cs *clientStream
+	a  *csAttempt
+
+	// Set in Marshal
+	buf []byte
+	err error
+}
+
+func (om *outgoingMessage) RawMessage() interface{} {
+	return om.m
+}
+
+func (om *outgoingMessage) Marshal() ([]byte, *transport.MessageInfo, error) {
+	if om.buf != nil || om.err != nil {
+		return om.buf, om.mi, om.err
+	}
+	cs := om.cs
+	data, err := encode(cs.codec, om.m)
+	if err != nil {
+		om.err = err
+		return nil, nil, err
+	}
+	compData, err := compress(data, cs.cp, cs.comp)
+	if err != nil {
+		om.err = err
+		return nil, nil, err
+	}
+	if compData != nil {
+		om.buf = compData
+	} else {
+		om.buf = data
+	}
+	if len(om.buf) > *cs.callInfo.maxSendMessageSize {
+		om.err = status.Errorf(codes.ResourceExhausted, "trying to send message larger than max (%d vs. %d)", len(om.buf), *cs.callInfo.maxSendMessageSize)
+		return nil, nil, om.err
+	}
+	if om.a.statsHandler != nil {
+		om.a.statsHandler.HandleRPC(cs.ctx, outPayload(true, om.m, data, om.buf, time.Now()))
+	}
+	om.m = nil
+	return om.buf, om.mi, nil
+}
+
 func (cs *clientStream) SendMsg(m interface{}) (err error) {
 	defer func() {
 		if err != nil && err != io.EOF {
@@ -620,27 +688,18 @@ func (cs *clientStream) SendMsg(m interface{}) (err error) {
 	if !cs.desc.ClientStreams {
 		cs.sentLast = true
 	}
-	data, err := encode(cs.codec, m)
-	if err != nil {
-		return err
-	}
-	compData, err := compress(data, cs.cp, cs.comp)
-	if err != nil {
-		return err
-	}
-	hdr, payload := msgHeader(data, compData)
-	// TODO(dfawley): should we be checking len(data) instead?
-	if len(payload) > *cs.callInfo.maxSendMessageSize {
-		return status.Errorf(codes.ResourceExhausted, "trying to send message larger than max (%d vs. %d)", len(payload), *cs.callInfo.maxSendMessageSize)
-	}
+	mi := &transport.MessageInfo{Encoding: cs.callHdr.ContentSubtype, Compressor: cs.callHdr.SendCompress}
+	om := &outgoingMessage{m: m, mi: mi, cs: cs}
 	op := func(a *csAttempt) error {
-		err := a.sendMsg(m, hdr, payload, data)
-		// nil out the message and uncomp when replaying; they are only needed for
-		// stats which is disabled for subsequent attempts.
-		m, data = nil, nil
+		om.a = a
+		err := a.sendMsg(om)
 		return err
 	}
-	return cs.withRetry(op, func() { cs.bufferForRetryLocked(len(hdr)+len(payload), op) })
+	err = cs.withRetry(op, func() {
+		om.Marshal()
+		cs.bufferForRetryLocked(len(om.buf), op)
+	})
+	return err
 }
 
 func (cs *clientStream) RecvMsg(m interface{}) error {
@@ -661,11 +720,13 @@ func (cs *clientStream) CloseSend() error {
 	}
 	cs.sentLast = true
 	op := func(a *csAttempt) error {
-		a.t.Write(a.s, nil, nil, &transport.Options{Last: true})
 		// Always return nil; io.EOF is the only error that might make sense
 		// instead, but there is no need to signal the client to call RecvMsg
 		// as the only use left for the stream after CloseSend is to call
 		// RecvMsg.  This also matches historical behavior.
+		if !a.s.SendMsg2(nil, client.StreamSendMsgOptions{CloseSend: true}) {
+			return a.s.RecvTrailer2().Status.Err()
+		}
 		return nil
 	}
 	cs.withRetry(op, func() { cs.bufferForRetryLocked(0, op) })
@@ -708,7 +769,7 @@ func (cs *clientStream) finish(err error) {
 	cs.cancel()
 }
 
-func (a *csAttempt) sendMsg(m interface{}, hdr, payld, data []byte) error {
+func (a *csAttempt) sendMsg(m transport.OutgoingMessage) error {
 	cs := a.cs
 	if EnableTracing {
 		a.mu.Lock()
@@ -717,7 +778,7 @@ func (a *csAttempt) sendMsg(m interface{}, hdr, payld, data []byte) error {
 		}
 		a.mu.Unlock()
 	}
-	if err := a.t.Write(a.s, hdr, payld, &transport.Options{Last: !cs.desc.ClientStreams}); err != nil {
+	if ok := a.s.SendMsg2(m, client.StreamSendMsgOptions{CloseSend: !cs.desc.ClientStreams}); !ok {
 		if !cs.desc.ClientStreams {
 			// For non-client-streaming RPCs, we return nil instead of EOF on error
 			// because the generated code requires it.  finish is not called; RecvMsg()
@@ -726,49 +787,82 @@ func (a *csAttempt) sendMsg(m interface{}, hdr, payld, data []byte) error {
 		}
 		return io.EOF
 	}
-	if a.statsHandler != nil {
-		a.statsHandler.HandleRPC(cs.ctx, outPayload(true, m, data, payld, time.Now()))
+	return nil
+}
+
+type incomingMessage struct {
+	m interface{}
+	a *csAttempt /* ???? XXX TODO */
+}
+
+func (im *incomingMessage) RawMessage() interface{} {
+	return im.m
+}
+
+func (im *incomingMessage) Unmarshal(buf [][]byte, mi *transport.MessageInfo) error {
+	// TODO XXXXXXXXX make io.Reader for [][]byte for decompressor.
+	if len(buf) != 1 {
+		return status.Errorf(codes.Internal, "scatter-gather unmarshal unsupported")
 	}
-	if channelz.IsOn() {
-		a.t.IncrMsgSent()
+	a := im.a
+	cs := a.cs
+	d := buf[0]
+	if mi.Compressor != "" {
+		if a.dc != nil && a.dc.Type() == mi.Compressor {
+			// Use olde style decompressor
+			var err error
+			d, err = a.dc.Do(bytes.NewReader(d))
+			if err != nil {
+				return status.Errorf(codes.Internal, "grpc: failed to decompress the received message %v", err)
+			}
+		} else {
+			decomp := encoding.GetCompressor(mi.Compressor)
+			if decomp == nil {
+				return status.Errorf(codes.Unimplemented, "grpc: Decompressor is not installed for grpc-encoding %q", mi.Compressor)
+			}
+			dcReader, err := decomp.Decompress(bytes.NewReader(d))
+			if err != nil {
+				return status.Errorf(codes.Internal, "grpc: failed to decompress the received message %v", err)
+			}
+			d, err = ioutil.ReadAll(dcReader)
+			if err != nil {
+				return status.Errorf(codes.Internal, "grpc: failed to decompress the received message %v", err)
+			}
+		}
+	}
+	if len(d) > *cs.callInfo.maxReceiveMessageSize {
+		// TODO: Revisit the error code. Currently keep it consistent with java
+		// implementation.
+		return status.Errorf(codes.ResourceExhausted, "grpc: received message larger than max (%d vs. %d)", len(d), *cs.callInfo.maxReceiveMessageSize)
+	}
+	// TODO XXXXXXXXX don't ignore mi.Encoding
+	if err := cs.codec.Unmarshal(d, im.m); err != nil {
+		return status.Errorf(codes.Internal, "grpc: failed to unmarshal the received message %v", err)
+	}
+	if a.statsHandler != nil {
+		inPayload := &stats.InPayload{
+			Client:   true,
+			RecvTime: time.Now(),
+			Payload:  im.m,
+			// TODO truncate large payload.
+			Data:   d,
+			Length: len(d),
+		}
+		a.statsHandler.HandleRPC(cs.ctx, inPayload)
 	}
 	return nil
 }
 
 func (a *csAttempt) recvMsg(m interface{}) (err error) {
 	cs := a.cs
-	var inPayload *stats.InPayload
-	if a.statsHandler != nil {
-		inPayload = &stats.InPayload{
-			Client: true,
+	im := &incomingMessage{m: m, a: a}
+	if ok := a.s.RecvMsg2(im); !ok {
+		if err := a.s.RecvTrailer2().Status.Err(); err != nil {
+			return err
 		}
+		return io.EOF // indicates successful end of stream.
 	}
-	if !a.decompSet {
-		// Block until we receive headers containing received message encoding.
-		if ct := a.s.RecvCompress(); ct != "" && ct != encoding.Identity {
-			if a.dc == nil || a.dc.Type() != ct {
-				// No configured decompressor, or it does not match the incoming
-				// message encoding; attempt to find a registered compressor that does.
-				a.dc = nil
-				a.decomp = encoding.GetCompressor(ct)
-			}
-		} else {
-			// No compression is used; disable our decompressor.
-			a.dc = nil
-		}
-		// Only initialize this state once per stream.
-		a.decompSet = true
-	}
-	err = recv(a.p, cs.codec, a.s, a.dc, m, *cs.callInfo.maxReceiveMessageSize, inPayload, a.decomp)
-	if err != nil {
-		if err == io.EOF {
-			if statusErr := a.s.Status().Err(); statusErr != nil {
-				return statusErr
-			}
-			return io.EOF // indicates successful end of stream.
-		}
-		return toRPCErr(err)
-	}
+
 	if EnableTracing {
 		a.mu.Lock()
 		if a.trInfo.tr != nil {
@@ -776,12 +870,11 @@ func (a *csAttempt) recvMsg(m interface{}) (err error) {
 		}
 		a.mu.Unlock()
 	}
-	if inPayload != nil {
-		a.statsHandler.HandleRPC(cs.ctx, inPayload)
-	}
-	if channelz.IsOn() {
-		a.t.IncrMsgRecv()
-	}
+	/*
+		if channelz.IsOn() {
+			a.t.IncrMsgRecv()
+		}
+	*/
 	if cs.desc.ServerStreams {
 		// Subsequent messages should be received by subsequent RecvMsg calls.
 		return nil
@@ -789,14 +882,10 @@ func (a *csAttempt) recvMsg(m interface{}) (err error) {
 
 	// Special handling for non-server-stream rpcs.
 	// This recv expects EOF or errors, so we don't collect inPayload.
-	err = recv(a.p, cs.codec, a.s, a.dc, m, *cs.callInfo.maxReceiveMessageSize, nil, a.decomp)
-	if err == nil {
-		return toRPCErr(errors.New("grpc: client streaming protocol violation: get <nil>, want <EOF>"))
+	if ok := a.s.RecvMsg2(im); ok {
+		return status.Error(codes.Unknown, "grpc: client streaming protocol violation: end of stream not encountered")
 	}
-	if err == io.EOF {
-		return a.s.Status().Err() // non-server streaming Recv returns nil on success
-	}
-	return toRPCErr(err)
+	return a.s.RecvTrailer2().Status.Err() // non-server streaming Recv returns nil on success
 }
 
 func (a *csAttempt) finish(err error) {
@@ -811,13 +900,13 @@ func (a *csAttempt) finish(err error) {
 		err = nil
 	}
 	if a.s != nil {
-		a.t.CloseStream(a.s, err)
+		a.s.Cancel2(status.Convert(err))
 	}
 
 	if a.done != nil {
 		br := false
 		if a.s != nil {
-			br = a.s.BytesReceived()
+			br = isSet(a.s.Info2().BytesReceived)
 		}
 		a.done(balancer.DoneInfo{
 			Err:           err,
@@ -897,8 +986,8 @@ type ServerStream interface {
 // serverStream implements a server side Stream.
 type serverStream struct {
 	ctx   context.Context
-	t     transport.ServerTransport
-	s     *transport.Stream
+	t     inttrans.ServerTransport
+	s     *inttrans.Stream
 	p     *parser
 	codec baseCodec
 
@@ -973,7 +1062,7 @@ func (ss *serverStream) SendMsg(m interface{}) (err error) {
 	if len(payload) > ss.maxSendMessageSize {
 		return status.Errorf(codes.ResourceExhausted, "trying to send message larger than max (%d vs. %d)", len(payload), ss.maxSendMessageSize)
 	}
-	if err := ss.t.Write(ss.s, hdr, payload, &transport.Options{Last: false}); err != nil {
+	if err := ss.t.Write(ss.s, hdr, payload, &inttrans.Options{Last: false}); err != nil {
 		return toRPCErr(err)
 	}
 	if ss.statsHandler != nil {

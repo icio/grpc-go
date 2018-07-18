@@ -39,12 +39,14 @@ import (
 	"google.golang.org/grpc/grpclog"
 	"google.golang.org/grpc/internal/backoff"
 	"google.golang.org/grpc/internal/channelz"
+	"google.golang.org/grpc/internal/grpcsync"
 	"google.golang.org/grpc/internal/transport"
 	"google.golang.org/grpc/keepalive"
 	"google.golang.org/grpc/resolver"
 	_ "google.golang.org/grpc/resolver/dns"         // To register dns resolver.
 	_ "google.golang.org/grpc/resolver/passthrough" // To register passthrough resolver.
 	"google.golang.org/grpc/status"
+	"google.golang.org/grpc/transport/client"
 )
 
 const (
@@ -709,7 +711,7 @@ func (cc *ClientConn) GetMethodConfig(method string) MethodConfig {
 	return m
 }
 
-func (cc *ClientConn) getTransport(ctx context.Context, failfast bool, method string) (transport.ClientTransport, func(balancer.DoneInfo), error) {
+func (cc *ClientConn) getTransport(ctx context.Context, failfast bool, method string) (client.Transport, func(balancer.DoneInfo), error) {
 	t, done, err := cc.blockingpicker.pick(ctx, failfast, balancer.PickOptions{
 		FullMethodName: method,
 	})
@@ -862,7 +864,7 @@ type addrConn struct {
 	events trace.EventLog
 	acbw   balancer.SubConn
 
-	transport transport.ClientTransport // The current transport.
+	transport client.Transport // The current transport.
 
 	mu      sync.Mutex
 	addrIdx int                // The index in addrs list to start reconnecting from.
@@ -1014,6 +1016,15 @@ func (ac *addrConn) resetTransport(resolveNow bool) {
 		}
 
 		if err := ac.createTransport(backoffIdx, addr, copts, connectDeadline); err != nil {
+			/*
+				timer := time.NewTimer(time.Until(ac.backoffDeadline))
+				select {
+				case <-timer.C:
+				case <-ac.ctx.Done():
+					timer.Stop()
+					return
+				}
+			*/
 			continue
 		}
 
@@ -1021,15 +1032,29 @@ func (ac *addrConn) resetTransport(resolveNow bool) {
 	}
 }
 
+type transMonitor struct {
+	onPrefaceReceipt func()
+	onError          func(error)
+}
+
+func (tm *transMonitor) OnConnected()    { tm.onPrefaceReceipt() }
+func (tm *transMonitor) OnError(e error) { tm.onError(e) }
+
 // createTransport creates a connection to one of the backends in addrs.
 func (ac *addrConn) createTransport(backoffNum int, addr resolver.Address, copts transport.ConnectOptions, connectDeadline time.Time) error {
+	target := transport.TargetInfo{
+		Addr:      addr.Addr,
+		Metadata:  addr.Metadata,
+		Authority: ac.cc.authority,
+	}
 	oneReset := sync.Once{}
 	skipReset := make(chan struct{})
 	allowedToReset := make(chan struct{})
 	prefaceReceived := make(chan struct{})
-	onCloseCalled := make(chan struct{})
+	onCloseCalled := grpcsync.NewEvent()
+	transportBuildError := make(chan error, 1)
 
-	onGoAway := func(r transport.GoAwayReason) {
+	/*	onGoAway := func(r transport.GoAwayReason) {
 		ac.mu.Lock()
 		ac.adjustParams(r)
 		ac.mu.Unlock()
@@ -1039,11 +1064,13 @@ func (ac *addrConn) createTransport(backoffNum int, addr resolver.Address, copts
 		case <-allowedToReset: // We're in the clear to reset.
 			go oneReset.Do(func() { ac.resetTransport(false) })
 		}
-	}
+	}*/
 
 	onClose := func() {
-		close(onCloseCalled)
-
+		onCloseCalled.Fire()
+		if err := <-transportBuildError; err != nil {
+			return
+		}
 		select {
 		case <-skipReset: // The outer resetTransport loop will handle reconnection.
 			return
@@ -1053,12 +1080,6 @@ func (ac *addrConn) createTransport(backoffNum int, addr resolver.Address, copts
 			ac.mu.Unlock()
 			oneReset.Do(func() { ac.resetTransport(false) })
 		}
-	}
-
-	target := transport.TargetInfo{
-		Addr:      addr.Addr,
-		Metadata:  addr.Metadata,
-		Authority: ac.cc.authority,
 	}
 
 	onPrefaceReceipt := func() {
@@ -1080,13 +1101,29 @@ func (ac *addrConn) createTransport(backoffNum int, addr resolver.Address, copts
 		copts.ChannelzParentID = ac.channelzID
 	}
 
-	newTr, err := transport.NewClientTransport(connectCtx, ac.cc.ctx, target, copts, onPrefaceReceipt, onGoAway, onClose)
+	mon := &transMonitor{
+		onPrefaceReceipt: onPrefaceReceipt,
+		// TODO: capture error!
+		onError: func(error) { onClose() },
+	}
+	bo := client.TransportBuildOptions{
+		Options: []interface{}{
+			&transport.ClientBuildOptions{
+				Ctx:        ac.cc.ctx,
+				Opts:       copts,
+				TargetInfo: target,
+			},
+		},
+	}
+	newTr, err := transport.CTB{}.Build(connectCtx, resolver.Address{}, mon, bo)
+	transportBuildError <- err
+	close(transportBuildError)
 
 	if err == nil {
 		prefaceTimer := time.AfterFunc(connectDeadline.Sub(time.Now()), func() {
 			ac.mu.Lock()
 			select {
-			case <-onCloseCalled:
+			case <-onCloseCalled.Done():
 				// The transport has already closed - noop.
 				ac.mu.Unlock()
 			case <-prefaceReceived:
@@ -1095,7 +1132,7 @@ func (ac *addrConn) createTransport(backoffNum int, addr resolver.Address, copts
 			default:
 				// We didn't get the preface in time.
 				ac.mu.Unlock()
-				newTr.Close()
+				newTr.Close2()
 			}
 		})
 		if ac.dopts.waitForHandshake {
@@ -1104,11 +1141,11 @@ func (ac *addrConn) createTransport(backoffNum int, addr resolver.Address, copts
 				// We want to close but _not_ reset, because we're going into the transient-failure-and-return flow
 				// and go into the next cycle of the resetTransport loop.
 				close(skipReset)
-				newTr.Close()
+				newTr.Close2()
 				err = errors.New("timed out")
 			case <-prefaceReceived:
 				// We got the preface - huzzah! things are good.
-			case <-onCloseCalled:
+			case <-onCloseCalled.Done():
 				// The transport has already closed - noop.
 			}
 		}
@@ -1151,7 +1188,8 @@ func (ac *addrConn) createTransport(backoffNum int, addr resolver.Address, copts
 		// in resetTransport take care of reconnecting.
 		close(skipReset)
 
-		newTr.Close()
+		// ac.tearDonn(...) has been invoked.
+		newTr.Close2()
 		return errConnClosing
 	}
 
@@ -1236,7 +1274,7 @@ func (ac *addrConn) resetConnectBackoff() {
 // getReadyTransport returns the transport if ac's state is READY.
 // Otherwise it returns nil, false.
 // If ac's state is IDLE, it will trigger ac to connect.
-func (ac *addrConn) getReadyTransport() (transport.ClientTransport, bool) {
+func (ac *addrConn) getReadyTransport() (client.Transport, bool) {
 	ac.mu.Lock()
 	if ac.state == connectivity.Ready && ac.transport != nil {
 		t := ac.transport
@@ -1280,7 +1318,7 @@ func (ac *addrConn) tearDown(err error) {
 		// address removal and GoAway.
 		// We have to unlock and re-lock here because GracefulClose => Close => onClose, which requires locking ac.mu.
 		ac.mu.Unlock()
-		ac.transport.GracefulClose()
+		ac.transport.GracefulClose2()
 		ac.mu.Lock()
 	}
 	if ac.events != nil {

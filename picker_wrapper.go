@@ -27,8 +27,8 @@ import (
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/grpclog"
 	"google.golang.org/grpc/internal/channelz"
-	"google.golang.org/grpc/internal/transport"
 	"google.golang.org/grpc/status"
+	"google.golang.org/grpc/transport/client"
 )
 
 // pickerWrapper is a wrapper of balancer.Picker. It blocks on certain pick
@@ -100,7 +100,7 @@ func doneChannelzWrapper(acw *acBalancerWrapper, done func(balancer.DoneInfo)) f
 // - the current picker returns other errors and failfast is false.
 // - the subConn returned by the current picker is not READY
 // When one of these situations happens, pick blocks until the picker gets updated.
-func (bp *pickerWrapper) pick(ctx context.Context, failfast bool, opts balancer.PickOptions) (transport.ClientTransport, func(balancer.DoneInfo), error) {
+func (bp *pickerWrapper) pick(ctx context.Context, failfast bool, opts balancer.PickOptions) (client.Transport, func(balancer.DoneInfo), error) {
 	var (
 		p  balancer.Picker
 		ch chan struct{}

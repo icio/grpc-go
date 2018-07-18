@@ -296,6 +296,14 @@ func TestRetryStreaming(t *testing.T) {
 			return nil
 		}
 	}
+	sHdr := func() serverOp {
+		return func(stream testpb.TestService_FullDuplexCallServer) error {
+			if err := stream.SendHeader(nil); err != nil {
+				return status.Errorf(codes.Internal, "server: SendHeader(nil) = %v; want <nil>", err)
+			}
+			return nil
+		}
+	}
 	sRes := func(b byte) serverOp {
 		return func(stream testpb.TestService_FullDuplexCallServer) error {
 			msg := res(b)
@@ -449,8 +457,15 @@ func TestRetryStreaming(t *testing.T) {
 		clientOps: []clientOp{cReq(1), cRes(3), cErr(codes.Unavailable)},
 	}, {
 		desc:      "No retry after header",
-		serverOps: []serverOp{sReq(1), sErr(codes.Unavailable)},
+		serverOps: []serverOp{sReq(1), sHdr(), sErr(codes.Unavailable)},
 		clientOps: []clientOp{cReq(1), cHdr(), cErr(codes.Unavailable)},
+	}, {
+		desc: "Retry when error instead of header",
+		serverOps: []serverOp{
+			sReq(1), sErr(codes.Unavailable),
+			sReq(1), sHdr(),
+		},
+		clientOps: []clientOp{cReq(1), cHdr(), cErr(codes.OK)},
 	}, {
 		desc:      "No retry after context",
 		serverOps: []serverOp{sReq(1), sErr(codes.Unavailable)},
@@ -527,6 +542,9 @@ func TestRetryStreaming(t *testing.T) {
 	cancel()
 
 	for _, tc := range testCases {
+		if tc.desc != "No retry after header" {
+			continue
+		}
 		func() {
 			serverOpIter = 0
 			serverOps = tc.serverOps

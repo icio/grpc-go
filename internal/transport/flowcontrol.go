@@ -20,6 +20,7 @@ package transport
 
 import (
 	"fmt"
+	"io"
 	"math"
 	"sync"
 	"sync/atomic"
@@ -60,7 +61,7 @@ func (w *writeQuota) get(sz int32) error {
 		case <-w.ch:
 			continue
 		case <-w.done:
-			return errStreamDone
+			return io.EOF
 		}
 	}
 }

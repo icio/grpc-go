@@ -1215,6 +1215,7 @@ func testServerMultipleGoAwayPendingRPC(t *testing.T, e env) {
 	}
 	<-ch1
 	<-ch2
+
 	cancel()
 	awaitNewConnLogOutput()
 }
@@ -1824,8 +1825,11 @@ func TestServiceConfigMaxMsgSize(t *testing.T) {
 	if err != nil {
 		t.Fatalf("%v.FullDuplexCall(_) = _, %v, want <nil>", tc, err)
 	}
-	if err = stream.Send(sreq); err == nil || status.Code(err) != codes.ResourceExhausted {
-		t.Fatalf("%v.Send(%v) = %v, want _, error code: %s", stream, sreq, err, codes.ResourceExhausted)
+	if err := stream.Send(sreq); err != io.EOF {
+		t.Fatalf("%v.Send(<len(Payload.Body)=%v>) = _, %v, want _, IO.EOF", stream, len(sreq.Payload.Body), err)
+	}
+	if _, err := stream.Recv(); status.Code(err) != codes.ResourceExhausted {
+		t.Fatalf("%v.Recv() = _, %v, want _, error code: %s", stream, err, codes.ResourceExhausted)
 	}
 
 	// Case2: Client API set maxReqSize to 1024 (send), maxRespSize to 1024 (recv). Sc sets maxReqSize to 2048 (send), maxRespSize to 2048 (recv).
@@ -1885,8 +1889,11 @@ func TestServiceConfigMaxMsgSize(t *testing.T) {
 	if err != nil {
 		t.Fatalf("%v.FullDuplexCall(_) = _, %v, want <nil>", tc, err)
 	}
-	if err = stream.Send(sreq); err == nil || status.Code(err) != codes.ResourceExhausted {
-		t.Fatalf("%v.Send(%v) = %v, want _, error code: %s", stream, sreq, err, codes.ResourceExhausted)
+	if err := stream.Send(sreq); err != io.EOF {
+		t.Fatalf("%v.Send(<len(Payload.Body)=%v>) = _, %v, want _, IO.EOF", stream, len(sreq.Payload.Body), err)
+	}
+	if _, err := stream.Recv(); status.Code(err) != codes.ResourceExhausted {
+		t.Fatalf("%v.Recv() = _, %v, want _, error code: %s", stream, err, codes.ResourceExhausted)
 	}
 
 	// Case3: Client API set maxReqSize to 4096 (send), maxRespSize to 4096 (recv). Sc sets maxReqSize to 2048 (send), maxRespSize to 2048 (recv).
@@ -1971,8 +1978,15 @@ func TestServiceConfigMaxMsgSize(t *testing.T) {
 		t.Fatalf("%v.Send(%v) = %v, want <nil>", stream, sreq, err)
 	}
 	sreq.Payload = extraLargePayload
-	if err := stream.Send(sreq); err == nil || status.Code(err) != codes.ResourceExhausted {
-		t.Fatalf("%v.Send(%v) = %v, want _, error code: %s", stream, sreq, err, codes.ResourceExhausted)
+
+	if err := stream.Send(sreq); err != io.EOF {
+		t.Fatalf("%v.Send(<len(Payload.Body)=%v>) = _, %v, want _, IO.EOF", stream, len(sreq.Payload.Body), err)
+	}
+	for err = nil; err == nil; _, err = stream.Recv() {
+	}
+
+	if status.Code(err) != codes.ResourceExhausted {
+		t.Fatalf("%v.Recv() = _, %v, want _, error code: %s", stream, err, codes.ResourceExhausted)
 	}
 }
 
@@ -2192,8 +2206,13 @@ func testMaxMsgSizeClientAPI(t *testing.T, e env) {
 	if err != nil {
 		t.Fatalf("%v.FullDuplexCall(_) = _, %v, want <nil>", tc, err)
 	}
-	if err := stream.Send(sreq); err == nil || status.Code(err) != codes.ResourceExhausted {
-		t.Fatalf("%v.Send(%v) = %v, want _, error code: %s", stream, sreq, err, codes.ResourceExhausted)
+	if err := stream.Send(sreq); err != io.EOF {
+		t.Fatalf("%v.Send(%v) = %v, want _, io.EOF", stream, sreq, err)
+	}
+	for err = nil; err == nil; _, err = stream.Recv() {
+	}
+	if status.Code(err) != codes.ResourceExhausted {
+		t.Fatalf("%v.Recv() = _, %v, want _, error code: %s", stream, err, codes.ResourceExhausted)
 	}
 }
 
@@ -5907,8 +5926,13 @@ func testServiceConfigMaxMsgSizeTD(t *testing.T, e env) {
 	if err != nil {
 		t.Fatalf("%v.FullDuplexCall(_) = _, %v, want <nil>", tc, err)
 	}
-	if err := stream.Send(sreq); err == nil || status.Code(err) != codes.ResourceExhausted {
-		t.Fatalf("%v.Send(%v) = %v, want _, error code: %s", stream, sreq, err, codes.ResourceExhausted)
+	if err := stream.Send(sreq); err != io.EOF {
+		t.Fatalf("%v.Send(%v) = %v, want _, io.EOF", stream, sreq, err)
+	}
+	for err = nil; err == nil; _, err = stream.Recv() {
+	}
+	if status.Code(err) != codes.ResourceExhausted {
+		t.Fatalf("%v.Recv() = _, %v, want _, error code: %s", stream, err, codes.ResourceExhausted)
 	}
 
 	// Case2: Client API set maxReqSize to 1024 (send), maxRespSize to 1024 (recv). Sc sets maxReqSize to 2048 (send), maxRespSize to 2048 (recv).
@@ -5956,8 +5980,13 @@ func testServiceConfigMaxMsgSizeTD(t *testing.T, e env) {
 	if err != nil {
 		t.Fatalf("%v.FullDuplexCall(_) = _, %v, want <nil>", tc, err)
 	}
-	if err := stream.Send(sreq); err == nil || status.Code(err) != codes.ResourceExhausted {
-		t.Fatalf("%v.Send(%v) = %v, want _, error code: %s", stream, sreq, err, codes.ResourceExhausted)
+	if err := stream.Send(sreq); err != io.EOF {
+		t.Fatalf("%v.Send(%v) = %v, want _, io.EOF", stream, sreq, err)
+	}
+	for err = nil; err == nil; _, err = stream.Recv() {
+	}
+	if status.Code(err) != codes.ResourceExhausted {
+		t.Fatalf("%v.Recv() = _, %v, want _, error code: %s", stream, err, codes.ResourceExhausted)
 	}
 
 	// Case3: Client API set maxReqSize to 4096 (send), maxRespSize to 4096 (recv). Sc sets maxReqSize to 2048 (send), maxRespSize to 2048 (recv).
@@ -6029,8 +6058,13 @@ func testServiceConfigMaxMsgSizeTD(t *testing.T, e env) {
 		t.Fatalf("%v.Send(%v) = %v, want <nil>", stream, sreq, err)
 	}
 	sreq.Payload = extraLargePayload
-	if err := stream.Send(sreq); err == nil || status.Code(err) != codes.ResourceExhausted {
-		t.Fatalf("%v.Send(%v) = %v, want _, error code: %s", stream, sreq, err, codes.ResourceExhausted)
+	if err := stream.Send(sreq); err != io.EOF {
+		t.Fatalf("%v.Send(%v) = %v, want _, io.EOF", stream, sreq, err)
+	}
+	for err = nil; err == nil; _, err = stream.Recv() {
+	}
+	if status.Code(err) != codes.ResourceExhausted {
+		t.Fatalf("%v.Recv() = _, %v, want _, error code: %s", stream, err, codes.ResourceExhausted)
 	}
 }
 

@@ -150,7 +150,9 @@ func TestNameDiscovery(t *testing.T) {
 	r.w.inject(updates)
 	// Loop until the rpcs in flight talks to servers[1].
 	for {
-		if err := cc.Invoke(context.Background(), "/foo/bar", &req, &reply); err != nil && errorDesc(err) == servers[1].port {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		if err := cc.Invoke(ctx, "/foo/bar", &req, &reply); err != nil && errorDesc(err) == servers[1].port {
 			break
 		}
 		time.Sleep(10 * time.Millisecond)

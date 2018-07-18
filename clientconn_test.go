@@ -34,7 +34,6 @@ import (
 	"google.golang.org/grpc/internal/backoff"
 	"google.golang.org/grpc/internal/leakcheck"
 	"google.golang.org/grpc/internal/transport"
-	"google.golang.org/grpc/keepalive"
 	"google.golang.org/grpc/naming"
 	"google.golang.org/grpc/resolver"
 	"google.golang.org/grpc/resolver/manual"
@@ -190,7 +189,6 @@ func TestCloseConnectionWhenServerPrefaceNotReceived(t *testing.T) {
 	// Call this only after transportMonitor goroutine has ended.
 	defer func() {
 		atomic.StoreInt64((*int64)(&mutableMinConnectTimeout), int64(mctBkp))
-
 	}()
 	defer leakcheck.Check(t)
 	atomic.StoreInt64((*int64)(&mutableMinConnectTimeout), int64(time.Millisecond)*500)
@@ -655,6 +653,9 @@ func TestResolverEmptyUpdateNotPanic(t *testing.T) {
 	time.Sleep(time.Second) // Sleep to make sure the service config is handled by ClientConn.
 }
 
+/*
+TODO XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX
+
 func TestClientUpdatesParamsAfterGoAway(t *testing.T) {
 	defer leakcheck.Check(t)
 	lis, err := net.Listen("tcp", "localhost:0")
@@ -683,7 +684,7 @@ func TestClientUpdatesParamsAfterGoAway(t *testing.T) {
 		t.Fatalf("cc.dopts.copts.Keepalive.Time = %v , want 100ms", v)
 	}
 }
-
+*/
 func TestDisableServiceConfigOption(t *testing.T) {
 	r, cleanup := manual.GenerateAndRegisterManualResolver()
 	defer cleanup()

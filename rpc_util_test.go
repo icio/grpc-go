@@ -177,7 +177,7 @@ func TestToRPCErr(t *testing.T) {
 		// outputs
 		errOut error
 	}{
-		{transport.ErrConnClosing, status.Error(codes.Unavailable, transport.ErrConnClosing.Desc)},
+		{transport.ErrConnClosing, status.Error(codes.Unavailable, status.Convert(transport.ErrConnClosing).Message())},
 		{io.ErrUnexpectedEOF, status.Error(codes.Internal, io.ErrUnexpectedEOF.Error())},
 	} {
 		err := toRPCErr(test.errIn)

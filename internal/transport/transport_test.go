@@ -43,6 +43,7 @@ import (
 	"google.golang.org/grpc/internal/leakcheck"
 	"google.golang.org/grpc/keepalive"
 	"google.golang.org/grpc/status"
+	"google.golang.org/grpc/transport/client"
 )
 
 type server struct {
@@ -407,12 +408,12 @@ func setUpWithOptions(t *testing.T, port int, serverConfig *ServerConfig, ht hTy
 		Addr: addr,
 	}
 	connectCtx, cancel := context.WithDeadline(context.Background(), time.Now().Add(2*time.Second))
-	ct, connErr := NewClientTransport(connectCtx, context.Background(), target, copts, func() {}, func(GoAwayReason) {}, func() {})
+	ct, connErr := newHTTP2Client(connectCtx, context.Background(), target, copts, func() {}, func(GoAwayReason) {}, func() {})
 	if connErr != nil {
 		cancel() // Do not cancel in success path.
 		t.Fatalf("failed to create transport: %v", connErr)
 	}
-	return server, ct.(*http2Client), cancel
+	return server, ct, cancel
 }
 
 func setUpWithNoPingServer(t *testing.T, copts ConnectOptions, done chan net.Conn) (*http2Client, func()) {
@@ -432,7 +433,7 @@ func setUpWithNoPingServer(t *testing.T, copts ConnectOptions, done chan net.Con
 		done <- conn
 	}()
 	connectCtx, cancel := context.WithDeadline(context.Background(), time.Now().Add(2*time.Second))
-	tr, err := NewClientTransport(connectCtx, context.Background(), TargetInfo{Addr: lis.Addr().String()}, copts, func() {}, func(GoAwayReason) {}, func() {})
+	tr, err := newHTTP2Client(connectCtx, context.Background(), TargetInfo{Addr: lis.Addr().String()}, copts, func() {}, func(GoAwayReason) {}, func() {})
 	if err != nil {
 		cancel() // Do not cancel in success path.
 		// Server clean-up.
@@ -442,7 +443,7 @@ func setUpWithNoPingServer(t *testing.T, copts ConnectOptions, done chan net.Con
 		}
 		t.Fatalf("Failed to dial: %v", err)
 	}
-	return tr.(*http2Client), cancel
+	return tr, cancel
 }
 
 // TestInflightStreamClosing ensures that closing in-flight stream
@@ -500,7 +501,7 @@ func TestMaxConnectionIdle(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Client failed to create RPC request: %v", err)
 	}
-	client.closeStream(stream, io.EOF, true, http2.ErrCodeCancel, nil, nil, false)
+	client.closeStream(stream, io.EOF, true, http2.ErrCodeCancel, false, nil)
 	// wait for server to see that closed stream and max-age logic to send goaway after no new RPCs are mode
 	timeout := time.NewTimer(time.Second * 4)
 	select {
@@ -911,7 +912,7 @@ func TestClientErrorNotify(t *testing.T) {
 	ct.Close()
 }
 
-func performOneRPC(ct ClientTransport) {
+func performOneRPC(ct *http2Client) {
 	callHdr := &CallHdr{
 		Host:   "localhost",
 		Method: "foo.Small",
@@ -941,7 +942,7 @@ func TestClientMix(t *testing.T) {
 		time.Sleep(5 * time.Second)
 		s.stop()
 	}(s)
-	go func(ct ClientTransport) {
+	go func(ct *http2Client) {
 		<-ct.Error()
 		ct.Close()
 	}(ct)
@@ -1083,7 +1084,6 @@ func TestLargeMessageWithDelayRead(t *testing.T) {
 
 func TestGracefulClose(t *testing.T) {
 	server, ct, cancel := setUp(t, 0, math.MaxUint32, pingpong)
-	defer cancel()
 	defer func() {
 		// Stop the server's listener to make the server's goroutines terminate
 		// (after the last active stream is done).
@@ -1093,6 +1093,7 @@ func TestGracefulClose(t *testing.T) {
 		leakcheck.Check(t)
 		// Correctly clean up the server
 		server.stop()
+		cancel()
 	}()
 	ctx, cancel := context.WithDeadline(context.Background(), time.Now().Add(time.Second*10))
 	defer cancel()
@@ -1147,8 +1148,8 @@ func TestGracefulClose(t *testing.T) {
 }
 
 func TestLargeMessageSuspension(t *testing.T) {
-	server, ct, cancel := setUp(t, 0, math.MaxUint32, suspended)
-	defer cancel()
+	server, ct, cancelsvr := setUp(t, 0, math.MaxUint32, suspended)
+	defer cancelsvr()
 	callHdr := &CallHdr{
 		Host:   "localhost",
 		Method: "foo.Large",
@@ -1170,7 +1171,7 @@ func TestLargeMessageSuspension(t *testing.T) {
 	msg := make([]byte, initialWindowSize*8)
 	ct.Write(s, nil, msg, &Options{})
 	err = ct.Write(s, nil, msg, &Options{Last: true})
-	if err != errStreamDone {
+	if err != io.EOF {
 		t.Fatalf("Write got %v, want io.EOF", err)
 	}
 	expectedErr := status.Error(codes.DeadlineExceeded, context.DeadlineExceeded.Error())
@@ -1636,7 +1637,7 @@ func TestClientWithMisbehavedServer(t *testing.T) {
 	}()
 	connectCtx, cancel := context.WithDeadline(context.Background(), time.Now().Add(2*time.Second))
 	defer cancel()
-	ct, err := NewClientTransport(connectCtx, context.Background(), TargetInfo{Addr: lis.Addr().String()}, ConnectOptions{}, func() {}, func(GoAwayReason) {}, func() {})
+	ct, err := newHTTP2Client(connectCtx, context.Background(), TargetInfo{Addr: lis.Addr().String()}, ConnectOptions{}, func() {}, func(GoAwayReason) {}, func() {})
 	if err != nil {
 		t.Fatalf("Error while creating client transport: %v", err)
 	}
@@ -1647,7 +1648,7 @@ func TestClientWithMisbehavedServer(t *testing.T) {
 	}
 	timer := time.NewTimer(time.Second * 5)
 	go func() { // This go routine mimics the one in stream.go to call CloseStream.
-		<-str.Done()
+		<-str.done
 		ct.CloseStream(str, nil)
 	}()
 	select {
@@ -1657,7 +1658,7 @@ func TestClientWithMisbehavedServer(t *testing.T) {
 	}
 }
 
-var encodingTestStatus = status.New(codes.Internal, "\n")
+var encodingTestStatus = status.New(codes.Internal, "\ntest\n")
 
 func TestEncodingRequiredStatus(t *testing.T) {
 	server, ct, cancel := setUp(t, 0, math.MaxUint32, encodingRequiredStatus)
@@ -1666,20 +1667,18 @@ func TestEncodingRequiredStatus(t *testing.T) {
 		Host:   "localhost",
 		Method: "foo",
 	}
-	s, err := ct.NewStream(context.Background(), callHdr)
+	s, err := ct.NewStream2(context.Background(), client.Header{Options: []interface{}{callHdr}})
 	if err != nil {
 		return
 	}
-	opts := Options{Last: true}
-	if err := ct.Write(s, nil, expectedRequest, &opts); err != nil && err != errStreamDone {
+	if err := ct.Write(s.(*stream2).ts, nil, expectedRequest, &Options{Last: true}); err != nil && err != io.EOF {
 		t.Fatalf("Failed to write the request: %v", err)
 	}
-	p := make([]byte, http2MaxFrameLen)
-	if _, err := s.trReader.(*transportReader).Read(p); err != io.EOF {
-		t.Fatalf("Read got error %v, want %v", err, io.EOF)
+	if ok := s.RecvMsg2(nil); ok {
+		t.Errorf("Read(_)=true; want false")
 	}
-	if !reflect.DeepEqual(s.Status(), encodingTestStatus) {
-		t.Fatalf("stream with status %v, want %v", s.Status(), encodingTestStatus)
+	if st := s.RecvTrailer2().Status; !reflect.DeepEqual(st, encodingTestStatus) {
+		t.Fatalf("stream with status %v, want %v", st, encodingTestStatus)
 	}
 	ct.Close()
 	server.stop()
@@ -1698,7 +1697,7 @@ func TestInvalidHeaderField(t *testing.T) {
 	}
 	p := make([]byte, http2MaxFrameLen)
 	_, err = s.trReader.(*transportReader).Read(p)
-	if se, ok := status.FromError(err); !ok || se.Code() != codes.Internal || !strings.Contains(err.Error(), expectedInvalidHeaderField) {
+	if se, ok := status.FromError(err); !ok || se.Code() != codes.Internal || !strings.Contains(se.Message(), expectedInvalidHeaderField) {
 		t.Fatalf("Read got error %v, want error with code %s and contains %q", err, codes.Internal, expectedInvalidHeaderField)
 	}
 	ct.Close()
@@ -2066,10 +2065,10 @@ func testHTTPToGRPCStatusMapping(t *testing.T, httpStatus int, wh writeHeaders) 
 	}
 	serr, ok := status.FromError(err)
 	if !ok {
-		t.Fatalf("err.(Type) = %T, want status error", err)
+		t.Fatalf("err = %v, want err.(Type)=*status.Status", err)
 	}
 	if want != serr.Code() {
-		t.Fatalf("Want error code: %v, got: %v", want, serr.Code())
+		t.Fatalf("Want error code: %v, got: %v", want, err)
 	}
 }
 
@@ -2078,12 +2077,9 @@ func TestHTTPStatusOKAndMissingGRPCStatus(t *testing.T) {
 	defer cleanUp()
 	buf := make([]byte, 8)
 	_, err := stream.Read(buf)
-	if err != io.EOF {
-		t.Fatalf("stream.Read(_) = _, %v, want _, io.EOF", err)
-	}
 	want := codes.Unknown
-	if stream.status.Code() != want {
-		t.Fatalf("Status code of stream: %v, want: %v", stream.status.Code(), want)
+	if st := status.Convert(err).Code(); st != want {
+		t.Fatalf("stream.Read(_) = _, %v, want: _, Code()=%v", st, want)
 	}
 }
 
