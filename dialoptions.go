@@ -33,6 +33,7 @@ import (
 	"google.golang.org/grpc/keepalive"
 	"google.golang.org/grpc/resolver"
 	"google.golang.org/grpc/stats"
+	"google.golang.org/grpc/transport/client"
 )
 
 // dialOptions configure a Dial call. dialOptions are set by the DialOption
@@ -48,7 +49,7 @@ type dialOptions struct {
 	timeout     time.Duration
 	scChan      <-chan ServiceConfig
 	authority   string
-	copts       transport.ConnectOptions
+	ctbopts     client.TransportBuildOptions
 	callOptions []CallOption
 	// This is used by v1 balancer dial option WithBalancer to support v1
 	// balancer, and also by WithBalancerName dial option.
@@ -445,9 +446,13 @@ func WithMaxHeaderListSize(s uint32) DialOption {
 func defaultDialOptions() dialOptions {
 	return dialOptions{
 		disableRetry: !envconfig.Retry,
-		copts: transport.ConnectOptions{
-			WriteBufferSize: defaultWriteBufSize,
-			ReadBufferSize:  defaultReadBufSize,
+		copts: client.TransportBuildOptions{
+			Options: []interface{}{
+				transport.ClientBuildOptions{
+					WriteBufferSize: defaultWriteBufSize,
+					ReadBufferSize:  defaultReadBufSize,
+				},
+			},
 		},
 	}
 }
