@@ -1066,22 +1066,6 @@ func (ac *addrConn) createTransport(backoffNum int, addr resolver.Address, copts
 		}
 	}*/
 
-	onClose := func() {
-		onCloseCalled.Fire()
-		if err := <-transportBuildError; err != nil {
-			return
-		}
-		select {
-		case <-skipReset: // The outer resetTransport loop will handle reconnection.
-			return
-		case <-allowedToReset: // We're in the clear to reset.
-			ac.mu.Lock()
-			ac.transport = nil
-			ac.mu.Unlock()
-			oneReset.Do(func() { ac.resetTransport(false) })
-		}
-	}
-
 	onPrefaceReceipt := func() {
 		close(prefaceReceived)
 
@@ -1104,7 +1088,22 @@ func (ac *addrConn) createTransport(backoffNum int, addr resolver.Address, copts
 	mon := &transMonitor{
 		onPrefaceReceipt: onPrefaceReceipt,
 		// TODO: capture error!
-		onError: func(error) { onClose() },
+		onError: func(err error) {
+			ac.cc.blockingpicker.updateConnectionError(err)
+			onCloseCalled.Fire()
+			if err := <-transportBuildError; err != nil {
+				return
+			}
+			select {
+			case <-skipReset: // The outer resetTransport loop will handle reconnection.
+				return
+			case <-allowedToReset: // We're in the clear to reset.
+				ac.mu.Lock()
+				ac.transport = nil
+				ac.mu.Unlock()
+				oneReset.Do(func() { ac.resetTransport(false) })
+			}
+		},
 	}
 	bo := client.TransportBuildOptions{
 		Options: []interface{}{
