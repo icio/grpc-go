@@ -467,15 +467,11 @@ func (cc *ClientConn) updateResolverState(s resolver.State) error {
 		return nil
 	}
 
-	if !cc.dopts.disableServiceConfig && cc.scRaw != s.ServiceConfig {
+	if !cc.dopts.disableServiceConfig {
 		// New service config; apply it.
-		sc, err := parseServiceConfig(s.ServiceConfig)
-		if err != nil {
-			fmt.Println("error parsing config: ", err)
-			return err
+		if sc, ok := s.ServiceConfig.(ServiceConfig); ok {
+			cc.sc = sc
 		}
-		cc.scRaw = s.ServiceConfig
-		cc.sc = sc
 
 		if cc.sc.retryThrottling != nil {
 			newThrottler := &retryThrottler{
@@ -490,24 +486,29 @@ func (cc *ClientConn) updateResolverState(s resolver.State) error {
 		}
 	}
 
+	var balCfg interface{}
 	if cc.dopts.balancerBuilder == nil {
 		// Only look at balancer types and switch balancer if balancer dial
 		// option is not set.
-		var isGRPCLB bool
-		for _, a := range s.Addresses {
-			if a.Type == resolver.GRPCLB {
-				isGRPCLB = true
-				break
-			}
-		}
 		var newBalancerName string
-		// TODO: use new loadBalancerConfig field with appropriate priority.
-		if isGRPCLB {
-			newBalancerName = grpclbName
-		} else if cc.sc.LB != nil {
-			newBalancerName = *cc.sc.LB
+		if cc.sc.lbConfig != nil {
+			newBalancerName = cc.sc.lbConfig.name
+			balCfg = cc.sc.lbConfig.cfg
 		} else {
-			newBalancerName = PickFirstBalancerName
+			var isGRPCLB bool
+			for _, a := range s.Addresses {
+				if a.Type == resolver.GRPCLB {
+					isGRPCLB = true
+					break
+				}
+			}
+			if isGRPCLB {
+				newBalancerName = grpclbName
+			} else if cc.sc.LB != nil {
+				newBalancerName = *cc.sc.LB
+			} else {
+				newBalancerName = PickFirstBalancerName
+			}
 		}
 		cc.switchBalancer(newBalancerName)
 	} else if cc.balancerWrapper == nil {
@@ -516,7 +517,7 @@ func (cc *ClientConn) updateResolverState(s resolver.State) error {
 		cc.balancerWrapper = newCCBalancerWrapper(cc, cc.dopts.balancerBuilder, cc.balancerBuildOpts)
 	}
 
-	cc.balancerWrapper.updateResolverState(s)
+	cc.balancerWrapper.updateClientConnState(&balancer.ClientConnState{ResolverState: s, BalancerConfig: balCfg})
 	cc.firstResolveEvent.Fire()
 	return nil
 }

@@ -25,8 +25,11 @@ import (
 	"strings"
 	"time"
 
+	"google.golang.org/grpc/balancer"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/grpclog"
+	"google.golang.org/grpc/internal"
+	"google.golang.org/grpc/serviceconfig"
 )
 
 const maxInt = int(^uint(0) >> 1)
@@ -61,6 +64,11 @@ type MethodConfig struct {
 	retryPolicy *retryPolicy
 }
 
+type lbConfig struct {
+	name string
+	cfg  interface{}
+}
+
 // ServiceConfig is provided by the service provider and contains parameters for how
 // clients that connect to the service should behave.
 //
@@ -68,9 +76,17 @@ type MethodConfig struct {
 // through name resolver, as specified here
 // https://github.com/grpc/grpc/blob/master/doc/service_config.md
 type ServiceConfig struct {
-	// LB is the load balancer the service providers recommends. The balancer specified
-	// via grpc.WithBalancer will override this.
+	serviceconfig.Config
+
+	// LB is the load balancer the service providers recommends. The balancer
+	// specified via grpc.WithBalancer will override this.  This is deprecated;
+	// lbConfigs is preferred.  If lbConfig and LB are both present, lbConfig
+	// will be used.
 	LB *string
+
+	// lbConfig is the service config's load balancing configuration.  If
+	// lbConfig and LB are both present, lbConfig will be used.
+	lbConfig *lbConfig
 
 	// Methods contains a map for the methods in this service.  If there is an
 	// exact match for a method (i.e. /service/method) in the map, use the
@@ -99,7 +115,11 @@ type ServiceConfig struct {
 	// healthCheckConfig must be set as one of the requirement to enable LB channel
 	// health check.
 	healthCheckConfig *healthCheckConfig
+
+	rawJSONString *string
 }
+
+type loadBalancingConfig map[string]json.RawMessage
 
 // healthCheckConfig defines the go-native version of the LB channel health check config.
 type healthCheckConfig struct {
@@ -233,9 +253,16 @@ type jsonMC struct {
 // TODO(lyuxuan): delete this struct after cleaning up old service config implementation.
 type jsonSC struct {
 	LoadBalancingPolicy *string
+	LoadBalancingConfig *[]loadBalancingConfig
 	MethodConfig        *[]jsonMC
 	RetryThrottling     *retryThrottlingPolicy
 	HealthCheckConfig   *healthCheckConfig
+}
+
+func init() {
+	internal.ParseServiceConfig = func(sc string) (interface{}, error) {
+		return parseServiceConfig(sc)
+	}
 }
 
 func parseServiceConfig(js string) (ServiceConfig, error) {
@@ -253,11 +280,38 @@ func parseServiceConfig(js string) (ServiceConfig, error) {
 		Methods:           make(map[string]MethodConfig),
 		retryThrottling:   rsc.RetryThrottling,
 		healthCheckConfig: rsc.HealthCheckConfig,
+		rawJSONString:     &js,
 	}
+	if rsc.LoadBalancingConfig != nil {
+		for i, lbcfg := range *rsc.LoadBalancingConfig {
+			if len(lbcfg) != 1 {
+				err := fmt.Errorf("invalid loadBalancingConfig: entry %v does not contain exactly 1 policy/config pair: %q", i, lbcfg)
+				grpclog.Warningf(err.Error())
+				return ServiceConfig{}, err
+			}
+			var name string
+			var jsonCfg json.RawMessage
+			for name, jsonCfg = range lbcfg {
+			}
+			builder := balancer.Get(name)
+			if builder == nil {
+				continue
+			}
+			sc.lbConfig = &lbConfig{name: name}
+			if parser, ok := builder.(balancer.Parser); ok {
+				var err error
+				sc.lbConfig.cfg, err = parser.Parse(jsonCfg)
+				if err != nil {
+					return ServiceConfig{}, fmt.Errorf("error parsing loadBalancingConfig for policy %q: %v", name, err)
+				}
+			}
+			break
+		}
+	}
+
 	if rsc.MethodConfig == nil {
 		return sc, nil
 	}
-
 	for _, m := range *rsc.MethodConfig {
 		if m.Name == nil {
 			continue
@@ -298,11 +352,11 @@ func parseServiceConfig(js string) (ServiceConfig, error) {
 	}
 
 	if sc.retryThrottling != nil {
-		if sc.retryThrottling.MaxTokens <= 0 ||
-			sc.retryThrottling.MaxTokens > 1000 ||
-			sc.retryThrottling.TokenRatio <= 0 {
-			// Illegal throttling config; disable throttling.
-			sc.retryThrottling = nil
+		if mt := sc.retryThrottling.MaxTokens; mt <= 0 || mt > 1000 {
+			return ServiceConfig{}, fmt.Errorf("invalid retry throttling config: maxTokens (%v) out of range (0, 1000]", mt)
+		}
+		if tr := sc.retryThrottling.TokenRatio; tr <= 0 {
+			return ServiceConfig{}, fmt.Errorf("invalid retry throttling config: tokenRatio (%v) may not be negative", tr)
 		}
 	}
 	return sc, nil
